@@ -6,8 +6,9 @@
 
 **A native-style macOS lock screen that unlocks with Touch ID.**
 
-Built for Macs where an MDM profile blocks fingerprint unlock at the system login window —
-the `LocalAuthentication` API still works inside a normal app, so your fingerprint works again.
+Lock your Mac from the menu bar or a shortcut, then unlock it with your fingerprint — even when
+Touch ID isn't available at the system login window. The `LocalAuthentication` API still works
+inside a normal app, so your fingerprint works again.
 
 [![Release](https://img.shields.io/github/v/release/haonguyenstech/maclock?label=release&color=blue)](https://github.com/haonguyenstech/maclock/releases/latest)
 [![Platform](https://img.shields.io/badge/macOS-14%2B-black?logo=apple)](https://www.apple.com/macos/)
@@ -90,7 +91,7 @@ lock (`⌃⌘Q`) for sensitive data. See the [why](#how-it-works) below.
 ## How it works
 
 - **Touch ID** goes through `LocalAuthentication` (`LAContext` + `deviceOwnerAuthenticationWithBiometrics`),
-  which an MDM `allowFingerprintForUnlock=false` profile does **not** block for third-party apps.
+  which keeps working for third-party apps even when biometric unlock is disabled for the system login window.
 - **Input blocking** uses a session-level `CGEventTap` at the head of the event chain; the lock window
   sits above `CGShieldingWindowLevel`, and a 1-second watchdog re-asserts the tap and window if anything
   tries to displace them.
@@ -114,5 +115,5 @@ To cut a new version: bump `CFBundleShortVersionString` in `Info.plist`, then ru
 ---
 
 <div align="center">
-<sub>MIT Licensed · Made for Macs stuck behind an MDM Touch-ID block.</sub>
+<sub>MIT Licensed · Bring Touch ID unlock back to your Mac.</sub>
 </div>
