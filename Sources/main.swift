@@ -52,9 +52,23 @@ final class Backlight {
         for id in activeDisplays() { _ = setFn(id, 0) }   // ép về 0, chống hệ thống kéo sáng lại
     }
     func restore() {
-        guard let setFn, dimmed else { return }
-        for (id, b) in saved { _ = setFn(id, b) }
+        guard let setFn else { return }
+        // Khôi phục theo MÀN HÌNH ĐANG HOẠT ĐỘNG (ID có thể đổi sau khi wake).
+        // Không bao giờ khôi phục về ~0 -> tránh kẹt màn đen.
+        let fallback = max(saved.values.max() ?? 0.7, 0.4)
+        for id in activeDisplays() {
+            let target = saved[id] ?? fallback
+            _ = setFn(id, target < 0.05 ? fallback : target)
+        }
         saved.removeAll(); dimmed = false
+    }
+    // Bảo hiểm: nếu đèn nền còn ~0 thì kéo lên mức nhìn được (gọi sau khi wake)
+    func ensureVisible() {
+        guard let getFn, let setFn else { return }
+        for id in activeDisplays() {
+            var b: Float = 0
+            if getFn(id, &b) == 0 && b < 0.05 { _ = setFn(id, 0.7) }
+        }
     }
 }
 
@@ -529,8 +543,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         applyDockVisibility()  // ẩn/hiện Dock theo cài đặt
         ensureAccessibility()
 
+        // Wake máy/màn hình -> luôn bật sáng + thoát tối (sự kiện wake KHÔNG qua event tap)
+        let wc = NSWorkspace.shared.notificationCenter
+        wc.addObserver(self, selector: #selector(systemDidWake),
+                       name: NSWorkspace.screensDidWakeNotification, object: nil)
+        wc.addObserver(self, selector: #selector(systemDidWake),
+                       name: NSWorkspace.didWakeNotification, object: nil)
+
         // tự mở Settings khi chạy kèm --settings (tiện xem nhanh)
         if CommandLine.arguments.contains("--settings") { openSettings() }
+    }
+
+    @objc func systemDidWake() {
+        guard locked else { return }
+        exitBlackout()             // bật sáng lại + thoát tối
+        lastActivity = Date()      // cho lại trọn thời gian idle trước khi tối lần nữa
+        reassert()                 // đảm bảo cửa sổ khóa vẫn ở trên cùng
+        // bảo hiểm: nếu panel chưa kịp sáng, kéo lên sau 0.6s
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+            if self.locked { Backlight.shared.ensureVisible() }
+        }
     }
 
     @objc func openSettings() {
