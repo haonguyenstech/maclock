@@ -72,6 +72,110 @@ final class Backlight {
     }
 }
 
+// ============ Tự cập nhật (GitHub Releases) ============
+let appVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev"
+let updateRepo = "haonguyenstech/maclock"
+let installedAppPath = Bundle.main.bundlePath   // thay thế app tại chính vị trí đang chạy
+
+/// So sánh phiên bản dạng "a.b.c": a có mới hơn b không?
+func isNewer(_ a: String, than b: String) -> Bool {
+    let pa = a.split(separator: ".").map { Int($0.prefix { $0.isNumber }) ?? 0 }
+    let pb = b.split(separator: ".").map { Int($0.prefix { $0.isNumber }) ?? 0 }
+    for i in 0..<max(pa.count, pb.count) {
+        let x = i < pa.count ? pa[i] : 0
+        let y = i < pb.count ? pb[i] : 0
+        if x != y { return x > y }
+    }
+    return false
+}
+
+/// Lấy release mới nhất: trả về (version, URL tải asset zip).
+func fetchLatestAppRelease() -> (version: String, zipURL: String)? {
+    guard let url = URL(string: "https://api.github.com/repos/\(updateRepo)/releases/latest") else { return nil }
+    var req = URLRequest(url: url); req.timeoutInterval = 10
+    req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+    var result: (String, String)?
+    let sem = DispatchSemaphore(value: 0)
+    URLSession.shared.dataTask(with: req) { data, _, _ in
+        defer { sem.signal() }
+        guard let data,
+              let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let tag = obj["tag_name"] as? String else { return }
+        let ver = tag.hasPrefix("v") ? String(tag.dropFirst()) : tag
+        let assets = obj["assets"] as? [[String: Any]] ?? []
+        guard let zip = assets.first(where: { ($0["name"] as? String)?.hasSuffix(".zip") == true }),
+              let dl = zip["url"] as? String else { return }   // asset API URL (cần Accept octet-stream)
+        result = (ver, dl)
+    }.resume()
+    _ = sem.wait(timeout: .now() + 12)
+    return result.map { (version: $0.0, zipURL: $0.1) }
+}
+
+final class Updater: ObservableObject {
+    @Published var status = ""
+    @Published var checking = false
+    @Published var updating = false
+    @Published var updateAvailable = false
+    @Published var latestVersion = ""
+    private var downloadURL = ""
+
+    func check(quiet: Bool = false) {
+        guard !checking, !updating else { return }
+        checking = true
+        if !quiet { status = "Checking…" }
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let rel = fetchLatestAppRelease()
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.checking = false
+                guard let rel else { if !quiet { self.status = "Couldn't reach GitHub" }; return }
+                self.latestVersion = rel.version
+                self.downloadURL = rel.zipURL
+                self.updateAvailable = isNewer(rel.version, than: appVersion)
+                if self.updateAvailable { self.status = "Update available: v\(rel.version)" }
+                else if !quiet { self.status = "You're on the latest version" }
+            }
+        }
+    }
+
+    func update() {
+        guard !updating, !downloadURL.isEmpty else { status = "Click Check first"; return }
+        updating = true; status = "Downloading update…"
+        let dl = downloadURL
+        let script = """
+        set -e
+        TMP=$(mktemp -d)
+        /usr/bin/curl -fsSL -H 'Accept: application/octet-stream' -o "$TMP/app.zip" '\(dl)'
+        /usr/bin/ditto -x -k "$TMP/app.zip" "$TMP/x"
+        SRC=$(/usr/bin/find "$TMP/x" -maxdepth 4 -name "MacLock.app" | head -1)
+        test -n "$SRC"
+        rm -rf '\(installedAppPath)'
+        /usr/bin/ditto "$SRC" '\(installedAppPath)'
+        /usr/bin/xattr -dr com.apple.quarantine '\(installedAppPath)' 2>/dev/null || true
+        rm -rf "$TMP"
+        """
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: "/bin/bash")
+            proc.arguments = ["-c", script]
+            let pipe = Pipe(); proc.standardOutput = pipe; proc.standardError = pipe
+            var code: Int32 = -1
+            do { try proc.run(); _ = pipe.fileHandleForReading.readDataToEndOfFile(); proc.waitUntilExit(); code = proc.terminationStatus }
+            catch { code = -1 }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.updating = false
+                if code != 0 { self.status = "Update failed — try again"; return }
+                // Chạy lại bản vừa cài rồi thoát bản hiện tại
+                let r = Process(); r.executableURL = URL(fileURLWithPath: "/bin/bash")
+                r.arguments = ["-c", "sleep 1; /usr/bin/open '\(installedAppPath)'"]
+                try? r.run()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { NSApp.terminate(nil) }
+            }
+        }
+    }
+}
+
 // ============ Login Item (khởi động cùng hệ thống) ============
 func loginItemEnabled() -> Bool {
     if #available(macOS 13, *) { return SMAppService.mainApp.status == .enabled }
@@ -221,6 +325,7 @@ struct SettingsView: View {
     @State private var launchAtLogin = loginItemEnabled()
     @AppStorage("showInDock") private var showInDock = true
     @AppStorage("blackoutMinutes") private var blackoutMinutes = 5
+    @StateObject private var updater = Updater()
 
     var body: some View {
         VStack(spacing: 0) {
@@ -283,6 +388,35 @@ struct SettingsView: View {
             }
             .padding(.horizontal, 20)
 
+            // ---- Version + Update ----
+            HStack(spacing: 10) {
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Version \(appVersion)").font(.system(size: 12, weight: .medium))
+                    if !updater.status.isEmpty {
+                        Text(updater.status).font(.system(size: 11))
+                            .foregroundStyle(updater.updateAvailable ? Color.accentColor : .secondary)
+                    }
+                }
+                Spacer()
+                if updater.updateAvailable {
+                    Button { updater.update() } label: {
+                        HStack(spacing: 5) {
+                            if updater.updating { ProgressView().controlSize(.small) }
+                            Text(updater.updating ? "Updating…" : "Update to v\(updater.latestVersion)")
+                        }
+                    }.buttonStyle(.borderedProminent).disabled(updater.updating)
+                } else {
+                    Button { updater.check() } label: {
+                        HStack(spacing: 5) {
+                            if updater.checking { ProgressView().controlSize(.small) }
+                            Text("Check for Updates")
+                        }
+                    }.buttonStyle(.bordered).disabled(updater.checking)
+                }
+            }
+            .padding(.horizontal, 20).padding(.top, 16)
+            .onAppear { updater.check(quiet: true) }   // âm thầm kiểm tra khi mở Settings
+
             // ---- Footer ----
             HStack(spacing: 10) {
                 Button { appDelegate?.lock() } label: {
@@ -292,7 +426,7 @@ struct SettingsView: View {
                 Button("Quit") { NSApp.terminate(nil) }
                     .buttonStyle(.bordered).controlSize(.large)
             }
-            .padding(.horizontal, 20).padding(.top, 18).padding(.bottom, 20)
+            .padding(.horizontal, 20).padding(.top, 14).padding(.bottom, 20)
         }
         .frame(width: 380)
         .background(Color(nsColor: .windowBackgroundColor))
