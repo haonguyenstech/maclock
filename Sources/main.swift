@@ -450,8 +450,9 @@ struct SettingsView: View {
     }
 }
 
-// ============ Cache wallpaper đã blur (chỉ tính 1 lần / lần khóa) ============
+// ============ Cache ảnh nền + avatar (chỉ tính 1 lần / lần khóa) ============
 var lockBackground: NSImage?
+var lockAvatar: NSImage?
 
 // ============ Borderless window nhận được bàn phím ============
 final class LockWindow: NSWindow {
@@ -472,11 +473,11 @@ func currentWallpaperBlurred() -> NSImage {
     var img: NSImage?
     if let screen = NSScreen.main, let url = ws.desktopImageURL(for: screen) { img = NSImage(contentsOf: url) }
     let base = img ?? NSImage(size: NSScreen.main?.frame.size ?? .init(width: 1728, height: 1117))
-    guard let tiff = base.tiffRepresentation, let ci = CIImage(data: tiff) else { return base }
-    let blur = CIFilter(name: "CIGaussianBlur")!
+    guard let tiff = base.tiffRepresentation, let ci = CIImage(data: tiff),
+          let blur = CIFilter(name: "CIGaussianBlur") else { return base }
     blur.setValue(ci.clampedToExtent(), forKey: kCIInputImageKey)
     blur.setValue(22.0, forKey: kCIInputRadiusKey)
-    let out = blur.outputImage!.cropped(to: ci.extent)
+    guard let out = blur.outputImage?.cropped(to: ci.extent) else { return base }
     let rep = NSCIImageRep(ciImage: out)
     let result = NSImage(size: rep.size); result.addRepresentation(rep)
     return result
@@ -614,12 +615,12 @@ struct LockView: View {
             tick(); model.onTouchID()
             if !model.tapActive { DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { focused = true } }
         }
-        .onReceive(timer) { _ in tick() }
+        .onReceive(timer) { _ in if !model.blackout { tick() } }   // tối màn hình -> khỏi cập nhật đồng hồ
     }
 
     var avatar: some View {
         Group {
-            if let img = loadAvatar() {
+            if let img = lockAvatar {
                 Image(nsImage: img).resizable().scaledToFill()
             } else { Image(systemName: "person.crop.circle.fill").resizable() }
         }
@@ -627,10 +628,21 @@ struct LockView: View {
         .overlay(Circle().stroke(.white.opacity(0.5), lineWidth: 1)).shadow(radius: 8)
     }
 
+    // Formatter tạo 1 lần (alloc DateFormatter khá đắt — trước đây tạo mỗi giây).
+    // Dùng template locale -> tôn trọng cài đặt 12/24 giờ của người dùng.
+    static let timeFmt: DateFormatter = {
+        let f = DateFormatter(); f.locale = .current
+        f.setLocalizedDateFormatFromTemplate("jmm"); return f
+    }()
+    static let dateFmt: DateFormatter = {
+        let f = DateFormatter(); f.locale = .current
+        f.dateFormat = "EEEE d MMMM"; return f
+    }()
+
     func tick() {
-        let f = DateFormatter(); f.locale = Locale.current
-        f.dateFormat = "H:mm"; time = f.string(from: Date())
-        f.dateFormat = "EEEE d MMMM"; date = f.string(from: Date())
+        let now = Date()
+        time = Self.timeFmt.string(from: now)
+        date = Self.dateFmt.string(from: now)
     }
 }
 
@@ -745,6 +757,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         locked = true
         lockModel.password = ""; lockModel.wrong = false; lockModel.errorText = ""
         lockBackground = currentWallpaperBlurred()   // blur 1 lần duy nhất ở đây
+        lockAvatar = loadAvatar()                     // đọc ảnh 1 lần, tránh decode mỗi giây
         lockModel.blackout = false
         lastActivity = Date()
         preventDisplaySleep(true)          // Option A: chặn native lock chen vào
@@ -932,11 +945,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 // ============ Kiểm mật khẩu đăng nhập thật qua PAM ============
 func pamCheck(user: String, pass: String) -> Bool {
     // gọi /usr/bin/dscl để verify (đơn giản, không cần link libpam)
+    // BẢO MẬT: KHÔNG truyền mật khẩu qua argv (bị lộ trên `ps aux`).
+    // Bỏ tham số mật khẩu -> dscl đọc từ stdin; ta bơm mật khẩu vào đó.
     let p = Process()
     p.executableURL = URL(fileURLWithPath: "/usr/bin/dscl")
-    p.arguments = [".", "-authonly", user, pass]
-    let pipe = Pipe(); p.standardError = pipe; p.standardOutput = pipe
-    do { try p.run(); p.waitUntilExit() } catch { return false }
+    p.arguments = [".", "-authonly", user]
+    let inPipe = Pipe(); p.standardInput = inPipe
+    let outPipe = Pipe(); p.standardError = outPipe; p.standardOutput = outPipe
+    do {
+        try p.run()
+        let handle = inPipe.fileHandleForWriting
+        handle.write(Data((pass + "\n").utf8))
+        try? handle.close()
+        p.waitUntilExit()
+    } catch { return false }
     return p.terminationStatus == 0
 }
 
