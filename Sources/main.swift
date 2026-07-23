@@ -6,7 +6,7 @@ import Carbon.HIToolbox
 import ServiceManagement
 import IOKit.pwr_mgt
 
-// ============ Danh sách màn hình đang hoạt động ============
+// ============ Active display list ============
 func activeDisplays() -> [CGDirectDisplayID] {
     var count: UInt32 = 0
     CGGetActiveDisplayList(0, nil, &count)
@@ -15,7 +15,7 @@ func activeDisplays() -> [CGDirectDisplayID] {
     return ids
 }
 
-// ============ Chống ngủ (Option A: không cho native lock chen vào) ============
+// ============ Prevent sleep (Option A: keep the native lock from taking over) ============
 var sleepAssertion: IOPMAssertionID = 0
 func preventDisplaySleep(_ on: Bool) {
     if on {
@@ -28,7 +28,7 @@ func preventDisplaySleep(_ on: Bool) {
     }
 }
 
-// ============ Điều khiển đèn nền (DisplayServices riêng, best-effort) ============
+// ============ Backlight control (private DisplayServices, best-effort) ============
 final class Backlight {
     typealias GetFn = @convention(c) (UInt32, UnsafeMutablePointer<Float>) -> Int32
     typealias SetFn = @convention(c) (UInt32, Float) -> Int32
@@ -49,12 +49,12 @@ final class Backlight {
             if let getFn { for id in activeDisplays() { var b: Float = 0; if getFn(id, &b) == 0 { saved[id] = b } } }
             dimmed = true
         }
-        for id in activeDisplays() { _ = setFn(id, 0) }   // ép về 0, chống hệ thống kéo sáng lại
+        for id in activeDisplays() { _ = setFn(id, 0) }   // force to 0, fight the system pulling brightness back up
     }
     func restore() {
         guard let setFn else { return }
-        // Khôi phục theo MÀN HÌNH ĐANG HOẠT ĐỘNG (ID có thể đổi sau khi wake).
-        // Không bao giờ khôi phục về ~0 -> tránh kẹt màn đen.
+        // Restore per ACTIVE DISPLAY (IDs can change after wake).
+        // Never restore to ~0 -> avoid getting stuck on a black screen.
         let fallback = max(saved.values.max() ?? 0.7, 0.4)
         for id in activeDisplays() {
             let target = saved[id] ?? fallback
@@ -62,7 +62,7 @@ final class Backlight {
         }
         saved.removeAll(); dimmed = false
     }
-    // Bảo hiểm: nếu đèn nền còn ~0 thì kéo lên mức nhìn được (gọi sau khi wake)
+    // Safety net: if the backlight is still ~0, raise it to a visible level (called after wake)
     func ensureVisible() {
         guard let getFn, let setFn else { return }
         for id in activeDisplays() {
@@ -72,12 +72,12 @@ final class Backlight {
     }
 }
 
-// ============ Tự cập nhật (GitHub Releases) ============
+// ============ Auto-update (GitHub Releases) ============
 let appVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev"
 let updateRepo = "haonguyenstech/maclock"
-let installedAppPath = Bundle.main.bundlePath   // thay thế app tại chính vị trí đang chạy
+let installedAppPath = Bundle.main.bundlePath   // replace the app in place, where it currently runs
 
-/// So sánh phiên bản dạng "a.b.c": a có mới hơn b không?
+/// Compare "a.b.c" versions: is a newer than b?
 func isNewer(_ a: String, than b: String) -> Bool {
     let pa = a.split(separator: ".").map { Int($0.prefix { $0.isNumber }) ?? 0 }
     let pb = b.split(separator: ".").map { Int($0.prefix { $0.isNumber }) ?? 0 }
@@ -89,7 +89,7 @@ func isNewer(_ a: String, than b: String) -> Bool {
     return false
 }
 
-/// Lấy release mới nhất: trả về (version, URL tải asset zip).
+/// Fetch the latest release: returns (version, zip asset download URL).
 func fetchLatestAppRelease() -> (version: String, zipURL: String)? {
     guard let url = URL(string: "https://api.github.com/repos/\(updateRepo)/releases/latest") else { return nil }
     var req = URLRequest(url: url); req.timeoutInterval = 10
@@ -104,7 +104,7 @@ func fetchLatestAppRelease() -> (version: String, zipURL: String)? {
         let ver = tag.hasPrefix("v") ? String(tag.dropFirst()) : tag
         let assets = obj["assets"] as? [[String: Any]] ?? []
         guard let zip = assets.first(where: { ($0["name"] as? String)?.hasSuffix(".zip") == true }),
-              let dl = zip["url"] as? String else { return }   // asset API URL (cần Accept octet-stream)
+              let dl = zip["url"] as? String else { return }   // asset API URL (needs Accept: octet-stream)
         result = (ver, dl)
     }.resume()
     _ = sem.wait(timeout: .now() + 12)
@@ -166,7 +166,7 @@ final class Updater: ObservableObject {
                 guard let self else { return }
                 self.updating = false
                 if code != 0 { self.status = "Update failed — try again"; return }
-                // Chạy lại bản vừa cài rồi thoát bản hiện tại
+                // Relaunch the freshly installed build, then quit the current one
                 let r = Process(); r.executableURL = URL(fileURLWithPath: "/bin/bash")
                 r.arguments = ["-c", "sleep 1; /usr/bin/open '\(installedAppPath)'"]
                 try? r.run()
@@ -176,7 +176,7 @@ final class Updater: ObservableObject {
     }
 }
 
-// ============ Login Item (khởi động cùng hệ thống) ============
+// ============ Login Item (start with the system) ============
 func loginItemEnabled() -> Bool {
     if #available(macOS 13, *) { return SMAppService.mainApp.status == .enabled }
     return false
@@ -193,14 +193,14 @@ func setLoginItem(_ on: Bool) {
 final class LockModel: ObservableObject {
     @Published var password = ""
     @Published var wrong = false
-    @Published var errorText = ""      // báo sai mật khẩu dưới ô input
-    @Published var tapActive = false   // true = event tap đang chặn phím
-    @Published var blackout = false    // true = MacLock đang tối đen màn hình
+    @Published var errorText = ""      // wrong-password message shown under the input
+    @Published var tapActive = false   // true = event tap is blocking keys
+    @Published var blackout = false    // true = MacLock is blacking out the screen
     var onSubmit: () -> Void = {}
     var onTouchID: () -> Void = {}
 }
 let lockModel = LockModel()
-var appDelegate: AppDelegate!    // set trong main
+var appDelegate: AppDelegate!    // set in main
 
 // ============ Global hotkey (Carbon) ============
 var hotKeyRef: EventHotKeyRef?
@@ -230,7 +230,7 @@ func savedHotkey() -> (keyCode: UInt32, mods: NSEvent.ModifierFlags, display: St
         let disp = d.string(forKey: "hkDisplay") ?? "⌃⌥L"
         return (kc, mods, disp)
     }
-    return (37, [.control, .option], "⌃⌥L")   // mặc định ⌃⌥L (L = keycode 37)
+    return (37, [.control, .option], "⌃⌥L")   // default ⌃⌥L (L = keycode 37)
 }
 func saveHotkey(keyCode: UInt16, mods: NSEvent.ModifierFlags, display: String) {
     let d = UserDefaults.standard
@@ -255,7 +255,7 @@ func registerHotkey(keyCode: UInt32, carbon: UInt32) {
     RegisterEventHotKey(keyCode, carbon, hkID, GetApplicationEventTarget(), 0, &hotKeyRef)
 }
 
-// ============ Key recorder (bắt tổ hợp phím mới) ============
+// ============ Key recorder (capture a new shortcut) ============
 final class RecorderView: NSView {
     var onCapture: (UInt16, NSEvent.ModifierFlags, String) -> Void = { _,_,_ in }
     var onRecordingChange: (Bool) -> Void = { _ in }
@@ -264,9 +264,9 @@ final class RecorderView: NSView {
     override func mouseDown(with e: NSEvent) { recording = true; window?.makeFirstResponder(self) }
     override func keyDown(with e: NSEvent) {
         guard recording else { return }
-        if e.keyCode == 53 { recording = false; window?.makeFirstResponder(nil); return }  // Esc huỷ
+        if e.keyCode == 53 { recording = false; window?.makeFirstResponder(nil); return }  // Esc cancels
         let mods = e.modifierFlags.intersection([.command, .option, .control, .shift])
-        guard !mods.isEmpty else { NSSound.beep(); return }   // yêu cầu ít nhất 1 phím bổ trợ
+        guard !mods.isEmpty else { NSSound.beep(); return }   // require at least one modifier key
         let ch = (e.charactersIgnoringModifiers ?? "").uppercased()
         onCapture(e.keyCode, mods, modSymbols(mods) + ch)
         recording = false
@@ -285,7 +285,7 @@ struct Recorder: NSViewRepresentable {
     }
 }
 
-// ============ Settings window (UI cao cấp kiểu macOS) ============
+// ============ Settings window (polished macOS-style UI) ============
 struct AppBadge: View {
     var size: CGFloat = 52
     var body: some View {
@@ -377,7 +377,7 @@ struct SettingsView: View {
                         Toggle("", isOn: $launchAtLogin).labelsHidden().toggleStyle(.switch)
                             .onChange(of: launchAtLogin) {
                                 setLoginItem(launchAtLogin)
-                                launchAtLogin = loginItemEnabled()   // đồng bộ lại trạng thái thật
+                                launchAtLogin = loginItemEnabled()   // re-sync with the real state
                             }
                     }
                 }
@@ -415,7 +415,7 @@ struct SettingsView: View {
                 }
             }
             .padding(.horizontal, 20).padding(.top, 16)
-            .onAppear { updater.check(quiet: true) }   // âm thầm kiểm tra khi mở Settings
+            .onAppear { updater.check(quiet: true) }   // silently check when Settings opens
 
             // ---- Footer ----
             HStack(spacing: 10) {
@@ -450,11 +450,11 @@ struct SettingsView: View {
     }
 }
 
-// ============ Cache ảnh nền + avatar (chỉ tính 1 lần / lần khóa) ============
+// ============ Cache wallpaper + avatar (computed once per lock) ============
 var lockBackground: NSImage?
 var lockAvatar: NSImage?
 
-// ============ Borderless window nhận được bàn phím ============
+// ============ Borderless window that can receive the keyboard ============
 final class LockWindow: NSWindow {
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { true }
@@ -483,18 +483,18 @@ func currentWallpaperBlurred() -> NSImage {
     return result
 }
 
-// ============ CGEventTap callback (nuốt toàn bộ phím) ============
+// ============ CGEventTap callback (swallow all keys) ============
 func tapCallback(proxy: CGEventTapProxy, type: CGEventType,
                  event: CGEvent, refcon: UnsafeMutableRawPointer?) -> Unmanaged<CGEvent>? {
-    // Hệ thống tự tắt tap -> bật lại
+    // System disabled the tap -> re-enable it
     if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
         if let tap = appDelegate?.eventTap { CGEvent.tapEnable(tap: tap, enable: true) }
         return Unmanaged.passUnretained(event)
     }
-    // Chưa khóa -> để mọi thứ đi bình thường
+    // Not locked -> let everything pass normally
     guard appDelegate?.locked == true else { return Unmanaged.passUnretained(event) }
 
-    appDelegate?.noteActivity()   // mọi thao tác -> thoát tối màn hình + reset đồng hồ idle
+    appDelegate?.noteActivity()   // any activity -> exit blackout + reset the idle timer
 
     switch type {
     case .keyDown:
@@ -509,18 +509,18 @@ func tapCallback(proxy: CGEventTapProxy, type: CGEventType,
         DispatchQueue.main.async {
             appDelegate?.handleKey(keycode: keycode, chars: chars, modified: hasCmdCtrlOptFn)
         }
-        return nil                                  // nuốt phím
+        return nil                                  // swallow the key
     case .keyUp, .flagsChanged, .scrollWheel:
-        return nil                                  // nuốt phím + cuộn/vuốt 2 ngón
+        return nil                                  // swallow keys + scroll / two-finger swipe
     case .mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged:
-        // Chặn hot corner: nuốt di chuyển khi con trỏ chạm sát góc màn hình
+        // Block hot corners: swallow movement when the cursor is right at a screen corner
         return appDelegate?.inHotCorner(event.location) == true ? nil : Unmanaged.passUnretained(event)
     default:
-        return nil                                  // gesture/swipe đa chạm (Mission Control/Spaces)
+        return nil                                  // multi-touch gesture/swipe (Mission Control/Spaces)
     }
 }
 
-// ============ SwiftUI lock view (chuẩn Tahoe) ============
+// ============ SwiftUI lock view (Tahoe-style) ============
 struct LockView: View {
     var onSuccess: () -> Void
     @ObservedObject var model = lockModel
@@ -531,7 +531,7 @@ struct LockView: View {
 
     var body: some View {
         ZStack {
-            Image(nsImage: lockBackground ?? NSImage())   // đã blur sẵn -> body nhẹ, không lag
+            Image(nsImage: lockBackground ?? NSImage())   // pre-blurred -> lightweight body, no lag
                 .resizable().scaledToFill()
                 .overlay(Color.black.opacity(0.15))
                 .ignoresSafeArea()
@@ -549,8 +549,8 @@ struct LockView: View {
                     avatar
                     Text(NSFullUserName()).font(.system(size: 17, weight: .medium)).foregroundStyle(.white)
 
-                    // Ô mật khẩu: tap BẬT -> hiển thị chấm (bơm qua handleKey);
-                    //             tap TẮT -> SecureField thật để gõ trực tiếp
+                    // Password field: tap ON  -> show dots (fed via handleKey);
+                    //                 tap OFF -> real SecureField for direct typing
                     HStack(spacing: 6) {
                         if model.tapActive {
                             Text(model.password.isEmpty ? "Enter Password"
@@ -580,14 +580,14 @@ struct LockView: View {
                     .overlay(Capsule().stroke(model.wrong ? Color.red.opacity(0.9)
                                                           : .white.opacity(0.35), lineWidth: model.wrong ? 1.2 : 0.8))
 
-                    // Dưới ô input: sai -> báo lỗi đỏ (không ảnh hưởng màn hình)
+                    // Below the input: wrong -> red error message (doesn't affect the screen)
                     if model.wrong {
                         Text(model.errorText)
                             .font(.system(size: 12, weight: .medium))
                             .foregroundStyle(Color.red.opacity(0.95))
                     }
 
-                    // Nút Touch ID CỐ ĐỊNH — luôn bấm được để kích hoạt vân tay
+                    // FIXED Touch ID button — always tappable to trigger the fingerprint prompt
                     Button(action: model.onTouchID) {
                         HStack(spacing: 6) {
                             Image(systemName: "touchid").font(.system(size: 18, weight: .semibold))
@@ -605,7 +605,7 @@ struct LockView: View {
                 Spacer(); Spacer()
             }
 
-            // Lớp tối đen do MacLock quản (thay cho display-sleep của hệ thống)
+            // Blackout layer managed by MacLock (replaces the system display-sleep)
             if model.blackout {
                 Color.black.ignoresSafeArea().transition(.opacity)
             }
@@ -615,7 +615,7 @@ struct LockView: View {
             tick(); model.onTouchID()
             if !model.tapActive { DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { focused = true } }
         }
-        .onReceive(timer) { _ in if !model.blackout { tick() } }   // tối màn hình -> khỏi cập nhật đồng hồ
+        .onReceive(timer) { _ in if !model.blackout { tick() } }   // blacked out -> skip updating the clock
     }
 
     var avatar: some View {
@@ -628,8 +628,8 @@ struct LockView: View {
         .overlay(Circle().stroke(.white.opacity(0.5), lineWidth: 1)).shadow(radius: 8)
     }
 
-    // Formatter tạo 1 lần (alloc DateFormatter khá đắt — trước đây tạo mỗi giây).
-    // Dùng template locale -> tôn trọng cài đặt 12/24 giờ của người dùng.
+    // Formatters created once (allocating a DateFormatter is fairly expensive — previously done every second).
+    // Use a locale template -> respect the user's 12/24-hour setting.
     static let timeFmt: DateFormatter = {
         let f = DateFormatter(); f.locale = .current
         f.setLocalizedDateFormatFromTemplate("jmm"); return f
@@ -669,7 +669,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let show = d.object(forKey: "showInDock") == nil ? true : d.bool(forKey: "showInDock")
         NSApp.setActivationPolicy(show ? .regular : .accessory)
         if show { NSApp.activate(ignoringOtherApps: true) }
-        // giữ cửa sổ Settings hiển thị sau khi đổi policy
+        // keep the Settings window visible after changing the policy
         if let w = settingsWin, w.isVisible {
             DispatchQueue.main.async { w.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true) }
         }
@@ -685,27 +685,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         lockModel.onSubmit  = { [weak self] in self?.verifyPassword() }
         lockModel.onTouchID = { [weak self] in self?.touchID() }
-        applyHotkey()          // đăng ký phím tắt khóa nhanh (mặc định ⌃⌥L)
-        applyDockVisibility()  // ẩn/hiện Dock theo cài đặt
+        applyHotkey()          // register the quick-lock shortcut (default ⌃⌥L)
+        applyDockVisibility()  // show/hide the Dock per the setting
         ensureAccessibility()
 
-        // Wake máy/màn hình -> luôn bật sáng + thoát tối (sự kiện wake KHÔNG qua event tap)
+        // Machine/display wake -> always turn brightness back on + exit blackout (wake events do NOT go through the event tap)
         let wc = NSWorkspace.shared.notificationCenter
         wc.addObserver(self, selector: #selector(systemDidWake),
                        name: NSWorkspace.screensDidWakeNotification, object: nil)
         wc.addObserver(self, selector: #selector(systemDidWake),
                        name: NSWorkspace.didWakeNotification, object: nil)
 
-        // tự mở Settings khi chạy kèm --settings (tiện xem nhanh)
+        // auto-open Settings when launched with --settings (handy for a quick look)
         if CommandLine.arguments.contains("--settings") { openSettings() }
     }
 
     @objc func systemDidWake() {
         guard locked else { return }
-        exitBlackout()             // bật sáng lại + thoát tối
-        lastActivity = Date()      // cho lại trọn thời gian idle trước khi tối lần nữa
-        reassert()                 // đảm bảo cửa sổ khóa vẫn ở trên cùng
-        // bảo hiểm: nếu panel chưa kịp sáng, kéo lên sau 0.6s
+        exitBlackout()             // turn brightness back on + exit blackout
+        lastActivity = Date()      // give the full idle time again before dimming next
+        reassert()                 // make sure the lock window stays on top
+        // safety net: if the panel isn't bright yet, raise it after 0.6s
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
             if self.locked { Backlight.shared.ensureVisible() }
         }
@@ -729,7 +729,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.activate(ignoringOtherApps: true)
     }
 
-    // ---- Xin quyền Accessibility (bắt buộc để nuốt phím) ----
+    // ---- Request Accessibility permission (required to swallow keys) ----
     func ensureAccessibility() {
         let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue(): true] as CFDictionary
         if !AXIsProcessTrustedWithOptions(opts) {
@@ -756,27 +756,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard !locked else { return }
         locked = true
         lockModel.password = ""; lockModel.wrong = false; lockModel.errorText = ""
-        lockBackground = currentWallpaperBlurred()   // blur 1 lần duy nhất ở đây
-        lockAvatar = loadAvatar()                     // đọc ảnh 1 lần, tránh decode mỗi giây
+        lockBackground = currentWallpaperBlurred()   // blur exactly once here
+        lockAvatar = loadAvatar()                     // load the image once, avoid decoding every second
         lockModel.blackout = false
         lastActivity = Date()
-        preventDisplaySleep(true)          // Option A: chặn native lock chen vào
+        preventDisplaySleep(true)          // Option A: keep the native lock from taking over
         startTap()
         NSApp.presentationOptions = lockOptions
         coverAllScreens()
         NSApp.activate(ignoringOtherApps: true)
 
-        // Phủ màn hình mới cắm vào khi đang khóa
+        // Cover a newly attached display while locked
         NotificationCenter.default.addObserver(self, selector: #selector(screensChanged),
             name: NSApplication.didChangeScreenParametersNotification, object: nil)
-        // Watchdog: giữ tap sống + khóa luôn ở trên cùng, chống cướp focus / tap bị tắt
+        // Watchdog: keep the tap alive + lock always on top, guard against focus theft / tap being disabled
         watchdog?.invalidate()
         watchdog = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             self?.reassert()
         }
     }
 
-    // Tạo cửa sổ khóa cho mọi màn hình chưa được phủ
+    // Create a lock window for every display not yet covered
     func coverAllScreens() {
         let covered = Set(wins.compactMap { $0.screen })
         for s in NSScreen.screens where !covered.contains(s) {
@@ -791,7 +791,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
     @objc func screensChanged() { guard locked else { return }; coverAllScreens() }
 
-    // Con trỏ có đang sát góc màn hình nào không (toạ độ CG, gốc trên-trái)
+    // Is the cursor near any screen corner? (CG coordinates, top-left origin)
     func inHotCorner(_ p: CGPoint) -> Bool {
         let m: CGFloat = 5
         for id in activeDisplays() {
@@ -804,28 +804,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return false
     }
 
-    // Định kỳ tái khẳng định trạng thái khóa (không cướp key của hộp thoại Touch ID)
+    // Periodically re-assert the locked state (without stealing key from the Touch ID dialog)
     func reassert() {
         guard locked else { return }
         if let tap = eventTap {
             if !CGEvent.tapIsEnabled(tap: tap) { CGEvent.tapEnable(tap: tap, enable: true) }
-        } else { startTap() }                       // tap chết -> dựng lại
+        } else { startTap() }                       // tap died -> rebuild it
         if NSApp.presentationOptions != lockOptions { NSApp.presentationOptions = lockOptions }
         let shield = NSWindow.Level(rawValue: Int(CGShieldingWindowLevel()) + 1)
         for w in wins where w.level != shield || !w.isVisible {
-            w.level = shield; w.orderFrontRegardless()   // đẩy lên lại nếu bị đè, KHÔNG makeKey
+            w.level = shield; w.orderFrontRegardless()   // push back up if covered, do NOT makeKey
         }
-        // ---- Cơ chế tối màn hình do MacLock quản ----
+        // ---- MacLock-managed blackout mechanism ----
         let d = UserDefaults.standard
         let mins = d.object(forKey: "blackoutMinutes") == nil ? 5 : d.integer(forKey: "blackoutMinutes")
         if lockModel.blackout {
-            Backlight.shared.dim()               // giữ đèn nền ở 0 (chống hệ thống kéo sáng)
+            Backlight.shared.dim()               // hold the backlight at 0 (fight the system raising it)
         } else if mins > 0 && Date().timeIntervalSince(lastActivity) >= Double(mins * 60) {
             enterBlackout()
         }
     }
 
-    // ---- Hoạt động của người dùng khi đang khóa (từ event tap) ----
+    // ---- User activity while locked (from the event tap) ----
     func noteActivity() {
         lastActivity = Date()
         if lockModel.blackout { exitBlackout() }
@@ -836,8 +836,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func unlock() {
         rearmWork?.cancel(); rearmWork = nil
         currentLA?.invalidate(); currentLA = nil
-        Backlight.shared.restore()         // trả lại độ sáng
-        preventDisplaySleep(false)         // cho hệ thống ngủ lại như thường
+        Backlight.shared.restore()         // restore brightness
+        preventDisplaySleep(false)         // let the system sleep normally again
         lockModel.blackout = false
         watchdog?.invalidate(); watchdog = nil
         NotificationCenter.default.removeObserver(self,
@@ -848,16 +848,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         locked = false
     }
 
-    // ---- CGEventTap: nuốt toàn bộ phím ----
+    // ---- CGEventTap: swallow all keys ----
     func startTap() {
         guard eventTap == nil else { return }
-        // Bàn phím + cuộn/vuốt + kéo chuột + gesture đa chạm (Mission Control/Spaces)
+        // Keyboard + scroll/swipe + mouse drag + multi-touch gestures (Mission Control/Spaces)
         let bits: [UInt64] = [
             UInt64(CGEventType.keyDown.rawValue), UInt64(CGEventType.keyUp.rawValue),
             UInt64(CGEventType.flagsChanged.rawValue), UInt64(CGEventType.scrollWheel.rawValue),
             UInt64(CGEventType.mouseMoved.rawValue), UInt64(CGEventType.leftMouseDragged.rawValue),
             UInt64(CGEventType.rightMouseDragged.rawValue), UInt64(CGEventType.otherMouseDragged.rawValue),
-            29, 30, 31   // gesture, magnify, swipe (đa chạm)
+            29, 30, 31   // gesture, magnify, swipe (multi-touch)
         ]
         var mask: UInt64 = 0
         for b in bits { mask |= (1 << b) }
@@ -865,14 +865,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                           options: .defaultTap, eventsOfInterest: CGEventMask(mask),
                                           callback: tapCallback, userInfo: nil) else {
             print("❌ Could not create event tap — Accessibility permission is missing.")
-            lockModel.tapActive = false     // -> LockView hiện SecureField để gõ thủ công
+            lockModel.tapActive = false     // -> LockView shows a SecureField for manual typing
             return
         }
         eventTap = tap
         let src = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
         CFRunLoopAddSource(CFRunLoopGetMain(), src, .commonModes)
         CGEvent.tapEnable(tap: tap, enable: true)
-        lockModel.tapActive = true          // -> chặn phím + bơm mật khẩu qua handleKey
+        lockModel.tapActive = true          // -> block keys + feed the password via handleKey
     }
     func stopTap() {
         if let tap = eventTap {
@@ -883,38 +883,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         lockModel.tapActive = false
     }
 
-    // ---- Nhập phím (từ tap bơm sang) ----
+    // ---- Key input (fed in from the tap) ----
     func handleKey(keycode: Int64, chars: String, modified: Bool) {
-        if lockModel.wrong { lockModel.wrong = false; lockModel.errorText = "" }  // gõ lại -> xóa lỗi
+        if lockModel.wrong { lockModel.wrong = false; lockModel.errorText = "" }  // typing again -> clear the error
         switch keycode {
         case 36, 76: verifyPassword()                                   // Return / Enter
         case 51: if !lockModel.password.isEmpty { lockModel.password.removeLast() } // Delete
-        case 53: break                                                  // Escape -> bỏ qua
+        case 53: break                                                  // Escape -> ignore
         default:
-            if modified { break }                                       // bỏ qua combo shortcut
+            if modified { break }                                       // ignore shortcut combos
             if !chars.isEmpty && chars.first!.isNewline == false { lockModel.password += chars }
         }
     }
 
-    // ---- Xác thực ----
+    // ---- Authentication ----
     var currentLA: LAContext?
     var rearmWork: DispatchWorkItem?
     func touchID() {
         guard locked else { return }
-        currentLA?.invalidate()                            // hủy phiên cũ nếu còn treo
+        rearmWork?.cancel(); rearmWork = nil               // cancel any pending rearm (avoid overlapping sessions)
+        currentLA?.invalidate()                            // cancel the old session if still pending
         let ctx = LAContext(); currentLA = ctx
-        ctx.localizedFallbackTitle = ""                    // ẩn nút "Enter Password" trong hộp thoại
+        ctx.localizedFallbackTitle = ""                    // hide the "Enter Password" button in the dialog
         var e: NSError?
         guard ctx.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: &e) else { return }
         ctx.evaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, localizedReason: "Unlock the screen") { ok, err in
             DispatchQueue.main.async {
                 if ok { self.unlock(); return }
-                // GIỮ VÂN TAY LUÔN SẴN SÀNG: sai ngón/timeout -> tự mở lại phiên
-                // (nếu bạn CHỦ ĐỘNG bấm Cancel thì thôi, để còn gõ mật khẩu)
-                guard self.locked else { return }
+                // Only handle the callback of the LATEST session (ignore superseded ones)
+                guard self.locked, self.currentLA === ctx else { return }
                 let code = (err as? LAError)?.code
-                if code != .userCancel && code != .systemCancel && code != .appCancel {
-                    self.rearmWork?.cancel()
+                let isCancel = code == .userCancel || code == .systemCancel || code == .appCancel
+                // KEEP TOUCH ID ALWAYS ARMED:
+                //  • Wrong finger / timeout  -> always rearm.
+                //  • CANCELLED (because typing the password took focus) -> in tap mode (keys are
+                //    swallowed by the event tap, no real SecureField) still rearm, so TOUCHING
+                //    the sensor while typing unlocks immediately. In fallback mode (real
+                //    SecureField) do NOT rearm on cancel, otherwise the Touch ID dialog would
+                //    keep stealing focus and block typing -> use the Touch ID button instead.
+                if !isCancel || lockModel.tapActive {
                     let w = DispatchWorkItem { self.touchID() }
                     self.rearmWork = w
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.4, execute: w)
@@ -926,7 +933,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let pass = lockModel.password
         guard !pass.isEmpty else { showError("Enter your password"); return }
         let user = NSUserName()
-        // Chạy dscl ở nền để KHÔNG khối UI
+        // Run dscl in the background so the UI is NOT blocked
         DispatchQueue.global(qos: .userInitiated).async {
             let ok = pamCheck(user: user, pass: pass)
             DispatchQueue.main.async {
@@ -942,11 +949,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
-// ============ Kiểm mật khẩu đăng nhập thật qua PAM ============
+// ============ Verify the real login password via PAM ============
 func pamCheck(user: String, pass: String) -> Bool {
-    // gọi /usr/bin/dscl để verify (đơn giản, không cần link libpam)
-    // BẢO MẬT: KHÔNG truyền mật khẩu qua argv (bị lộ trên `ps aux`).
-    // Bỏ tham số mật khẩu -> dscl đọc từ stdin; ta bơm mật khẩu vào đó.
+    // call /usr/bin/dscl to verify (simple, no need to link libpam)
+    // SECURITY: do NOT pass the password via argv (leaks in `ps aux`).
+    // Omit the password argument -> dscl reads from stdin; we feed the password there.
     let p = Process()
     p.executableURL = URL(fileURLWithPath: "/usr/bin/dscl")
     p.arguments = [".", "-authonly", user]
@@ -963,7 +970,7 @@ func pamCheck(user: String, pass: String) -> Bool {
 }
 
 let app = NSApplication.shared
-app.setActivationPolicy(.regular)   // TẠM: hiện icon dưới Dock để dễ thấy
+app.setActivationPolicy(.regular)   // TEMP: show the Dock icon so it's easy to spot
 appDelegate = AppDelegate()
 app.delegate = appDelegate
 app.run()
