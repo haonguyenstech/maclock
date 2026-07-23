@@ -38,8 +38,17 @@ if [ -f AppIcon.icns ]; then
   cp AppIcon.icns "$BUNDLE/Contents/Resources/AppIcon.icns"
 fi
 
-echo "Signing (ad-hoc)…"
-codesign --force --deep --sign - "$BUNDLE"
+# Prefer the stable self-signed identity (created by ./setup-signing.sh) so the
+# app's designated requirement — and therefore its TCC/Accessibility grant —
+# survives every rebuild/update. Fall back to ad-hoc if it isn't installed.
+SIGN_ID="MacLock Code Signing"
+if security find-certificate -c "$SIGN_ID" >/dev/null 2>&1; then
+  echo "Signing (stable identity: $SIGN_ID)…"
+  codesign --force --deep --sign "$SIGN_ID" "$BUNDLE"
+else
+  echo "Signing (ad-hoc — run ./setup-signing.sh for a stable Accessibility grant)…"
+  codesign --force --deep --sign - "$BUNDLE"
+fi
 
 echo "Done: $BUNDLE"
 echo "Launch: open \"$BUNDLE\""
